@@ -17,7 +17,7 @@ def quantize(weights, config, args):
 
     # Load the model:
     model = model_class(model_args_class.from_dict(config))
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=False)
 
     # Quantize the model:
     nn.QuantizedLinear.quantize_module(

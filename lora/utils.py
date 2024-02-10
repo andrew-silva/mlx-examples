@@ -168,7 +168,7 @@ def load(path_or_hf_repo: str):
             and m.weight.shape[0] != 8,
         )
 
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=False)
 
     mx.eval(model.parameters())
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
