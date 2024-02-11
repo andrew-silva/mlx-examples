@@ -10,6 +10,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import models.llama as llama
 import models.mixtral as mixtral
+
+import numpy as np
 import transformers
 from huggingface_hub import snapshot_download
 
@@ -19,6 +21,86 @@ MODEL_MAPPING = {
     "mistral": llama,  # mistral is compatible with llama
     "mixtral": mixtral,
 }
+
+
+class RunningMoments:
+    def __init__(self):
+        """
+        Calculates the running mean and standard deviation of a data stream. Reference:
+        https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/utils.py#L75
+        """
+        self.mean = 0.0
+        self.std = 1.0
+        self.var = 1.0
+        self.count = 1e-24
+
+    def update(self, xs: mx.array):
+        """
+        Updates running moments from batch's moments computed across ranks
+        """
+        xs_count = xs.size
+        xs_var = mx.var(xs)
+        xs_mean = mx.mean(xs)
+        xs_mean = xs_mean.item()
+        xs_var = xs_var.item()
+
+        delta = xs_mean - self.mean
+        tot_count = self.count + xs_count
+
+        new_sum = xs_var * xs_count
+        # correct old_sum deviation accounting for the new mean
+        old_sum = self.var * self.count + delta**2 * self.count * xs_count / tot_count
+        tot_sum = old_sum + new_sum
+
+        self.mean += delta * xs_count / tot_count
+        self.var = tot_sum / tot_count
+        self.std = mx.sqrt(self.var * tot_count / (tot_count - 1)).item()
+        self.count = tot_count
+
+        return xs_mean, mx.sqrt(xs_var * xs_count / (xs_count - 1)).item()
+
+
+def compute_accuracy(eval_pred):
+    predictions, labels = eval_pred
+    # Here, predictions is rewards_chosen and rewards_rejected.
+    # We want to see how much of the time rewards_chosen > rewards_rejected.
+    if np.array(predictions[:, 0] == predictions[:, 1], dtype=float).sum() > 0:
+        print(
+            f"There are {np.array(predictions[:, 0] == predictions[:, 1]).sum()} out of {len(predictions[:, 0])} instances where the predictions for both options are equal. As a consequence the accuracy can be misleading."
+        )
+    predictions = np.argmax(predictions, axis=1)
+
+    accuracy = np.array(predictions == labels, dtype=float).mean().item()
+    return {"accuracy": accuracy}
+
+
+def pad_to_length(tensor: mx.array, length: int, pad_value, dim: int = -1) -> mx.array:
+    if tensor.shape[dim] >= length:
+        return tensor
+    else:
+        pad_size = list(tensor.shape)
+        pad_size[dim] = length - tensor.shape[dim]
+        return mx.concatenate(
+            [
+                tensor,
+                pad_value * mx.ones(*pad_size, dtype=tensor.dtype),
+            ],
+            axis=dim,
+        )
+
+
+def disable_dropout_in_model(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = 0
+
+
+def exact_div(a, b, a_str, b_str, custom_error_message=""):
+    q = a // b
+    if a != q * b:
+        raise ValueError(f"{custom_error_message}, {a_str}={a}, {b_str}={b}, inexact division: {a} / {b} = {a / b}")
+    return q
+
 
 
 def _get_classes(config: dict):

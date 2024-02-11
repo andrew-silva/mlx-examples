@@ -119,7 +119,7 @@ def build_parser():
     return parser
 
 
-class Dataset:
+class TuningDataset:
     """
     Light-weight wrapper to hold lines from a jsonl file
     """
@@ -141,7 +141,7 @@ class Dataset:
 
 def load(args):
     names = ("train", "valid", "test")
-    train, valid, test = (Dataset(Path(args.data) / f"{n}.jsonl") for n in names)
+    train, valid, test = (TuningDataset(Path(args.data) / f"{n}.jsonl") for n in names)
     if args.train and len(train) == 0:
         raise ValueError(
             "Training set not found or empty. Must provide training set for fine-tuning."
