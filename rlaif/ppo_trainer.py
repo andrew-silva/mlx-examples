@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
 import math
-import os
 import time
 import typing
 import warnings
@@ -26,9 +24,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
-from models.base import create_reference_model, Dataset
+from models.base import create_reference_model
 
-from datasets import Dataset as HFDataset
 from transformers import (
     DataCollatorForLanguageModeling,
     PreTrainedTokenizer,
@@ -36,10 +33,14 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from utils import RunningMoments
+from utils import RunningMoments, stats_to_np, set_seed, \
+    masked_whiten, masked_mean, masked_var, clip_by_value, \
+    entropy_from_logits, logprobs_from_logits, flatten_dict, \
+    convert_to_scalar, stack_dicts, AdaptiveKLController, FixedKLController
 from config import PPOConfig
 
 EPS = 1e-6
+
 
 # Running TO-DO list:
 # 1. Convert optimizer step into mlx format
@@ -77,16 +78,16 @@ class PPOTrainer:
         **num_shared_layers** (int, *optional*) -- Number of layers to be shared between the model and the reference
             model, if no reference model is passed. If no number is provided, all the layers will be shared.
     """
+
     def __init__(
-        self,
-        config: PPOConfig = None,
-        model: PreTrainedModelWrapper = None,
-        ref_model: Optional[PreTrainedModelWrapper] = None,
-        tokenizer: PreTrainedTokenizerBase = None,
-        dataset: Optional[Union[Dataset, HFDataset]] = None,
-        optimizer: Optional[optim.Optimizer] = None,
-        data_collator: Optional[typing.Callable] = None,
-        num_shared_layers: Optional[int] = None,
+            self,
+            config: PPOConfig = None,
+            model=None,
+            ref_model=None,
+            tokenizer: PreTrainedTokenizerBase = None,
+            optimizer: Optional[optim.Optimizer] = None,
+            data_collator: Optional[typing.Callable] = None,
+            num_shared_layers: Optional[int] = None,
     ):
         """
         Initialize PPOTrainer.
@@ -100,10 +101,6 @@ class PPOTrainer:
                 Hugging Face transformer model with a casual language modelling head. Used for KL penalty
             tokenizer (`transformers.PreTrainedTokenizerBase`):
                 Hugging Face tokenizer
-            dataset (Optional[Union[Dataset, `datasets.Dataset`]]):
-                custom dataset or Hugging Face dataset. If a Hugging Face dataset is passed, the dataset
-                will be preprocessed by removing the columns that are not used by the model. If none is passed,
-                a warning will be raised in a multi-GPU setting.
             optimizer (Optional[`mlx.optim.Optimizer`]):
                 Optimizer used for training. If `None`, the `Adam` is used as default.
             data_collator (Optional[function]):
@@ -123,10 +120,6 @@ class PPOTrainer:
             raise ValueError(
                 f"tokenizer must be a PreTrainedTokenizerBase like a PreTrainedTokenizer or a PreTrainedTokenizerFast, got {type(tokenizer)}"
             )
-        if not isinstance(model, (SUPPORTED_ARCHITECTURES)):
-            raise ValueError(
-                f"model must be a PreTrainedModelWrapper, got {type(model)} - supported architectures are: {SUPPORTED_ARCHITECTURES}"
-            )
 
         self.model = model
         self.model_params = filter(lambda p: p.requires_grad, self.model.parameters())
@@ -137,7 +130,7 @@ class PPOTrainer:
 
         self.is_using_text_environment = getattr(config, "use_text_environment", False)
 
-        if isinstance(ref_model, SUPPORTED_ARCHITECTURES):
+        if ref_model is not None:
             self.ref_model = ref_model
             if num_shared_layers is not None:
                 warnings.warn(
@@ -149,13 +142,9 @@ class PPOTrainer:
             self.ref_model = create_reference_model(self.model, num_shared_layers=num_shared_layers)
         elif self.is_peft_model:
             self.ref_model = None
-        else:
-            raise ValueError(
-                f"ref_model must be a PreTrainedModelWrapper or `None`, got {type(ref_model)} - supported "
-                f"architectures are: {SUPPORTED_ARCHITECTURES} "
-            )
+
         self.optional_peft_ctx = (
-            self.accelerator.unwrap_model(self.model).pretrained_model.disable_adapter
+            self.model.pretrained_model.disable_adapter
             if self.is_peft_model
             else nullcontext
         )
@@ -166,22 +155,13 @@ class PPOTrainer:
             )
         self.tokenizer = tokenizer
 
-        if dataset is not None and not (isinstance(dataset, Dataset) or isinstance(dataset, HFDataset)):
-            raise ValueError("dataset must be a Dataset or datasets.Dataset")
-        elif dataset is None:
-            warnings.warn(
-                "No dataset is provided. Make sure to set config.batch_size to the correct value before training.",
-                UserWarning,
-            )
-        self.dataset = dataset
         self._signature_columns = None
-        if self.dataset is not None:
-            self.dataloader = self.prepare_dataloader(self.dataset, data_collator)
-        else:
-            self.dataloader = None
 
         # Step 3: Initialize optimizer and data collator
-        self.data_collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
+        if data_collator is None:
+            self.data_collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
+        else:
+            self.data_collator = data_collator
         if optimizer is None:
             self.optimizer = optim.Adam(
                 learning_rate=self.config.learning_rate,
@@ -203,58 +183,14 @@ class PPOTrainer:
 
         self.running = RunningMoments()
 
-    def prepare_dataloader(self, dataset: Union[Dataset, HFDataset], data_collator=None):
-        """
-        Prepare the dataloader for training.
-
-        Args:
-            dataset (Union[`Dataset`, `datasets.Dataset`]):
-                custom dataset or Hugging Face dataset. If a Hugging Face dataset is passed, the dataset
-                will be preprocessed by removing the columns that are not used by the model.
-            data_collator (Optional[function]):
-                Data collator function.
-
-        Returns:
-            `DataLoader`: dataloader
-        """
-        if isinstance(dataset, HFDataset):
-            dataset = self._remove_unused_columns(dataset)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            collate_fn=data_collator,
-            shuffle=True,
-            drop_last=True,
-        )
-        return dataloader
-
-    # Adapted from transformers.Trainer._set_signature_columns_if_needed
-    def _set_signature_columns_if_needed(self):
-        if self._signature_columns is None:
-            # Inspect model forward signature to keep only the arguments it accepts.
-            signature = inspect.signature(self.model.forward)
-            self._signature_columns = list(signature.parameters.keys())
-            # label => sentiment | we need query and response for logging purpose
-            self._signature_columns += ["label", "query", "response"]
-
-    # Adapted from transformers.Trainer._remove_unused_columns
-    def _remove_unused_columns(self, dataset: HFDataset):
-        if not self.config.remove_unused_columns:
-            return dataset
-        self._set_signature_columns_if_needed()
-        signature_columns = self._signature_columns
-
-        ignored_columns = list(set(dataset.column_names) - set(signature_columns))
-        return dataset.remove_columns(ignored_columns)
-
     def generate(
-        self,
-        query_tensor: Union[mx.array, List[mx.array]],
-        length_sampler: Callable = None,
-        batch_size: int = 4,
-        return_prompt: bool = True,
-        generate_ref_response: bool = False,
-        **generation_kwargs,
+            self,
+            query_tensor: Union[mx.array, List[mx.array]],
+            length_sampler: Callable = None,
+            batch_size: int = 4,
+            return_prompt: bool = True,
+            generate_ref_response: bool = False,
+            **generation_kwargs,
     ):
         """
         Generate response with the model given the query tensor.
@@ -307,32 +243,32 @@ class PPOTrainer:
 
             if length_sampler is not None:
                 generation_kwargs["max_new_tokens"] = length_sampler()
-            response = self.accelerator.unwrap_model(self.model).generate(
-                input_ids=query_tensor.unsqueeze(dim=0), **generation_kwargs
+            response = self.model.generate(
+                input_ids=query_tensor[None, :], **generation_kwargs
             )
             if generate_ref_response:
                 with self.optional_peft_ctx():
-                    ref_response = ref_model.generate(input_ids=query_tensor.unsqueeze(dim=0), **generation_kwargs)
+                    ref_response = ref_model.generate(input_ids=query_tensor[None, :], **generation_kwargs)
 
             if not return_prompt and not self.is_encoder_decoder:
-                response = response[:, query_tensor.shape[0] :]
+                response = response[:, query_tensor.shape[0]:]
                 if generate_ref_response:
-                    ref_response = ref_response[:, query_tensor.shape[0] :]
+                    ref_response = ref_response[:, query_tensor.shape[0]:]
 
         if generate_ref_response:
             return response, ref_response
         return response
 
     def _generate_batched(
-        self,
-        model: PreTrainedModelWrapper,
-        query_tensors: List[mx.array],
-        length_sampler: Callable = None,
-        batch_size: int = 4,
-        return_prompt: bool = True,
-        pad_to_multiple_of: int = None,
-        remove_padding: bool = True,
-        **generation_kwargs,
+            self,
+            model,
+            query_tensors: List[mx.array],
+            length_sampler: Callable = None,
+            batch_size: int = 4,
+            return_prompt: bool = True,
+            pad_to_multiple_of: int = None,
+            remove_padding: bool = True,
+            **generation_kwargs,
     ):
         outputs = []
 
@@ -360,18 +296,18 @@ class PPOTrainer:
                 max_length=None,
                 pad_to_multiple_of=pad_to_multiple_of,
                 return_tensors="pt",
-            ).to(self.current_device)
+            )
 
-            generations = self.accelerator.unwrap_model(model).generate(**padded_inputs, **generation_kwargs)
+            generations = model.generate(**padded_inputs, **generation_kwargs)
 
             for generation, mask in zip(generations, padded_inputs["attention_mask"]):
                 if not self.is_encoder_decoder:
-                    output = generation[(1 - mask).sum() :]  # remove padding
+                    output = generation[(1 - mask).sum():]  # remove padding
                 else:
                     output = generation
 
                 if not return_prompt and not self.is_encoder_decoder:
-                    output = output[(mask).sum() :]  # remove prompt
+                    output = output[(mask).sum():]  # remove prompt
 
                 if remove_padding and self.tokenizer.eos_token_id in output:
                     pad_mask = output == self.tokenizer.eos_token_id
@@ -384,12 +320,12 @@ class PPOTrainer:
         return outputs
 
     def _step_safety_checker(
-        self,
-        batch_size: int,
-        queries: List[mx.array],
-        responses: List[mx.array],
-        scores: List[mx.array],
-        masks: Optional[List[mx.array]] = None,
+            self,
+            batch_size: int,
+            queries: List[mx.array],
+            responses: List[mx.array],
+            scores: List[mx.array],
+            masks: Optional[List[mx.array]] = None,
     ):
         """
         Check if the input data is valid for training.
@@ -434,11 +370,11 @@ class PPOTrainer:
         return queries, responses, scores, masks
 
     def step(
-        self,
-        queries: List[mx.array],
-        responses: List[mx.array],
-        scores: List[mx.array],
-        response_masks: Optional[List[mx.array]] = None,
+            self,
+            queries: List[mx.array],
+            responses: List[mx.array],
+            scores: List[mx.array],
+            response_masks: Optional[List[mx.array]] = None,
     ):
         """
         Run a PPO optimisation step given a list of queries, model responses, and rewards.
@@ -524,42 +460,42 @@ class PPOTrainer:
 
         full_kl_penalty = self.config.kl_penalty == "full"
 
-        with torch.no_grad():
-            all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
-                self.model,
+        # with torch.no_grad():
+        all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
+            self.model,
+            queries,
+            responses,
+            model_inputs,
+            response_masks=response_masks,
+            return_logits=full_kl_penalty,
+        )
+        with self.optional_peft_ctx():
+            ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
+                self.model if self.is_peft_model else self.ref_model,
                 queries,
                 responses,
                 model_inputs,
-                response_masks=response_masks,
                 return_logits=full_kl_penalty,
             )
-            with self.optional_peft_ctx():
-                ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
-                    self.model if self.is_peft_model else self.ref_model,
-                    queries,
-                    responses,
-                    model_inputs,
-                    return_logits=full_kl_penalty,
-                )
 
         timing["time/ppo/forward_pass"] = time.time() - t
 
-        with torch.no_grad():
-            t = time.time()
-            if full_kl_penalty:
-                active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
-                ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
+        # with torch.no_grad():
+        t = time.time()
+        if full_kl_penalty:
+            active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
+            ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
 
-                rewards, non_score_reward, kls = self.compute_rewards(
-                    scores, active_full_logprobs, ref_full_logprobs, masks
-                )
-            else:
-                rewards, non_score_reward, kls = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
-            timing["time/ppo/compute_rewards"] = time.time() - t
+            rewards, non_score_reward, kls = self.compute_rewards(
+                scores, active_full_logprobs, ref_full_logprobs, masks
+            )
+        else:
+            rewards, non_score_reward, kls = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
+        timing["time/ppo/compute_rewards"] = time.time() - t
 
-            t = time.time()
-            values, advantages, returns = self.compute_advantages(values, rewards, masks)
-            timing["time/ppo/compute_advantages"] = time.time() - t
+        t = time.time()
+        values, advantages, returns = self.compute_advantages(values, rewards, masks)
+        timing["time/ppo/compute_advantages"] = time.time() - t
 
         # upcast to float32 to avoid dataset issues
         batch_dict = {
@@ -700,11 +636,11 @@ class PPOTrainer:
         if self.is_encoder_decoder:
             input_data = self.data_collator(
                 [{"input_ids": q, "attention_mask": mx.ones_like(q)} for q in queries]
-            ).to(self.current_device)
+            )
 
             decoder_inputs = self.data_collator(
                 [{"input_ids": r, "attention_mask": mx.ones_like(r)} for r in responses]
-            ).to(self.current_device)
+            )
 
             input_data["decoder_input_ids"] = decoder_inputs["input_ids"]
             input_data["decoder_attention_mask"] = decoder_inputs["attention_mask"]
@@ -712,19 +648,19 @@ class PPOTrainer:
             input_ids = [mx.concatenate([q, r]) for q, r in zip(queries, responses)]
             input_data = self.data_collator(
                 [{"input_ids": ids, "attention_mask": mx.ones_like(ids)} for ids in input_ids]
-            ).to(self.current_device)
+            )
 
         input_data.pop("labels", None)  # we don't want to compute LM losses
         return input_data
 
     def batched_forward_pass(
-        self,
-        model: PreTrainedModelWrapper,
-        queries: mx.array,
-        responses: mx.array,
-        model_inputs: dict,
-        return_logits: bool = False,
-        response_masks: Optional[mx.array] = None,
+            self,
+            model,
+            queries: mx.array,
+            responses: mx.array,
+            model_inputs: dict,
+            return_logits: bool = False,
+            response_masks: Optional[mx.array] = None,
     ):
         """
         Calculate model outputs in multiple batches.
@@ -754,11 +690,11 @@ class PPOTrainer:
         model.eval()
 
         for i in range(math.ceil(bs / fbs)):
-            input_kwargs = {key: value[i * fbs : (i + 1) * fbs] for key, value in model_inputs.items()}
-            query_batch = queries[i * fbs : (i + 1) * fbs]
-            response_batch = responses[i * fbs : (i + 1) * fbs]
+            input_kwargs = {key: value[i * fbs: (i + 1) * fbs] for key, value in model_inputs.items()}
+            query_batch = queries[i * fbs: (i + 1) * fbs]
+            response_batch = responses[i * fbs: (i + 1) * fbs]
             if response_masks is not None:
-                response_masks_batch = response_masks[i * fbs : (i + 1) * fbs]
+                response_masks_batch = response_masks[i * fbs: (i + 1) * fbs]
             logits, _, values = model(**input_kwargs)
 
             if self.is_encoder_decoder:
@@ -808,15 +744,15 @@ class PPOTrainer:
         )
 
     def train_minibatch(
-        self,
-        old_logprobs: mx.array,
-        values: mx.array,
-        logprobs: mx.array,
-        logits: mx.array,
-        vpreds: mx.array,
-        mask: mx.array,
-        advantages: mx.array,
-        returns: mx.array,
+            self,
+            old_logprobs: mx.array,
+            values: mx.array,
+            logprobs: mx.array,
+            logits: mx.array,
+            vpreds: mx.array,
+            mask: mx.array,
+            advantages: mx.array,
+            returns: mx.array,
     ):
         """
         Train one PPO minibatch
@@ -850,11 +786,11 @@ class PPOTrainer:
         return train_stats
 
     def compute_rewards(
-        self,
-        scores: mx.array,
-        logprobs: mx.array,
-        ref_logprobs: mx.array,
-        masks: mx.array,
+            self,
+            scores: mx.array,
+            logprobs: mx.array,
+            ref_logprobs: mx.array,
+            masks: mx.array,
     ):
         """
         Compute per token rewards from scores and KL-penalty.
@@ -898,16 +834,16 @@ class PPOTrainer:
             return 0.5 * (logprob - ref_logprob).square()
 
         if self.config.kl_penalty == "full":
-            # Flip is required due to this issue? :https://github.com/pytorch/pytorch/issues/57459
-            return F.kl_div(ref_logprob, logprob, log_target=True, reduction="none").sum(-1)
+            # TODO: log being passed in is a problem potentially
+            return nn.losses.kl_div_loss(logprob, ref_logprob, reduction="none").sum(-1)
 
         raise NotImplementedError
 
     def compute_advantages(
-        self,
-        values: mx.array,
-        rewards: mx.array,
-        mask: mx.array,
+            self,
+            values: mx.array,
+            rewards: mx.array,
+            mask: mx.array,
     ):
         lastgaelam = 0
         advantages_reversed = []
@@ -932,15 +868,15 @@ class PPOTrainer:
         return values, advantages, returns
 
     def loss(
-        self,
-        old_logprobs: mx.array,
-        values: mx.array,
-        logits: mx.array,
-        vpreds: mx.array,
-        logprobs: mx.array,
-        mask: mx.array,
-        advantages: mx.array,
-        returns: mx.array,
+            self,
+            old_logprobs: mx.array,
+            values: mx.array,
+            logits: mx.array,
+            vpreds: mx.array,
+            logprobs: mx.array,
+            mask: mx.array,
+            advantages: mx.array,
+            returns: mx.array,
     ):
         """
         Calculate policy and value losses.
@@ -1085,11 +1021,11 @@ class PPOTrainer:
         return stats
 
     def log_stats(
-        self,
-        stats: dict,
-        batch: dict,
-        rewards: List[mx.array],
-        columns_to_log: List[str] = ["query", "response"],
+            self,
+            stats: dict,
+            batch: dict,
+            rewards: List[mx.array],
+            columns_to_log: List[str] = ["query", "response"],
     ):
         """
         A function that logs all the training stats. Call it at the end of each epoch.
@@ -1138,27 +1074,28 @@ class PPOTrainer:
             # update the current step
             self.current_step += 1
 
+        # TODO: WANDB LOG HERE
         self.accelerator.log(
             logs,
             step=self.current_step if self.config.log_with == "tensorboard" else None,
         )
 
     def _save_pretrained(self, save_directory: str) -> None:
-        self.accelerator.unwrap_model(self.model).save_pretrained(save_directory)
+        self.model.save_pretrained(save_directory)
         self.tokenizer.save_pretrained(save_directory)
-        self.create_model_card(save_directory)
 
     def _show_tokens(self, tokens, masks):
-        from rich import print
-        from rich.text import Text
-
-        text = Text()
-
-        for i, (token, mask) in enumerate(zip(tokens, masks)):
-            if mask == 1:
-                text.append(self.tokenizer.decode(token.item()), style="black on deep_sky_blue1")
-                text.append(" ")
-            else:
-                text.append(self.tokenizer.decode(token.item()), style="black on cyan3")
-                text.append(" ")
+        # from rich import print
+        # from rich.text import Text
+        #
+        # text = Text()
+        #
+        # for i, (token, mask) in enumerate(zip(tokens, masks)):
+        #     if mask == 1:
+        #         text.append(self.tokenizer.decode(token.item()), style="black on deep_sky_blue1")
+        #         text.append(" ")
+        #     else:
+        #         text.append(self.tokenizer.decode(token.item()), style="black on cyan3")
+        #         text.append(" ")
+        text = self.tokenizer.decode(tokens)
         print(text)

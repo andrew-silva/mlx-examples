@@ -4,7 +4,8 @@ import glob
 import json
 import logging
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Dict, Mapping, List
+import random
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -60,6 +61,35 @@ class RunningMoments:
         return xs_mean, mx.sqrt(xs_var * xs_count / (xs_count - 1)).item()
 
 
+
+class AdaptiveKLController:
+    """
+    Adaptive KL controller described in the paper:
+    https://arxiv.org/pdf/1909.08593.pdf
+    """
+
+    def __init__(self, init_kl_coef, target, horizon):
+        self.value = init_kl_coef
+        self.target = target
+        self.horizon = horizon
+
+    def update(self, current, n_steps):
+        target = self.target
+        proportional_error = np.clip(current / target - 1, -0.2, 0.2)
+        mult = 1 + proportional_error * n_steps / self.horizon
+        self.value *= mult
+
+
+class FixedKLController:
+    """Fixed KL controller."""
+
+    def __init__(self, kl_coef):
+        self.value = kl_coef
+
+    def update(self, current, n_steps):
+        pass
+
+
 def compute_accuracy(eval_pred):
     predictions, labels = eval_pred
     # Here, predictions is rewards_chosen and rewards_rejected.
@@ -72,6 +102,161 @@ def compute_accuracy(eval_pred):
 
     accuracy = np.array(predictions == labels, dtype=float).mean().item()
     return {"accuracy": accuracy}
+
+
+def set_seed(seed: int) -> None:
+    """
+    Helper function for reproducible behavior to set the seed in `random`, `numpy`, and `torch`.
+
+    Args:
+        seed (`int`): The seed to set.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    mx.random.seed(seed)
+
+
+def pad_to_size(tensor: mx.array, size: int, dim: int = 1, padding: int = 50256) -> mx.array:
+    """Pad tensor to size."""
+    t_size = tensor.shape[dim]
+    if t_size == size:
+        return tensor
+    else:
+        return mx.pad(tensor, (0, size - t_size), padding)
+
+
+def logprobs_from_logits(logits: mx.array, labels: mx.array, gather: bool = True) -> mx.array:
+    """
+    See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
+    """
+    logp = mx.log(mx.softmax(logits, axis=2))
+
+    if not gather:
+        return logp
+    # TODO This is broken.
+    logpy = logp[mx.arange(logp.shape[0]), mx.arange(logp.shape[1]), labels[:, :, None]]
+    return logpy
+
+
+def whiten(values: mx.array, shift_mean: bool = True) -> mx.array:
+    """Whiten values."""
+    mean, var = mx.mean(values), mx.var(values)
+    whitened = (values - mean) * mx.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
+def masked_mean(values: mx.array, mask: mx.array, axis: bool = None) -> mx.array:
+    """Compute mean of tensor with a masked values."""
+    if axis is not None:
+        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+    else:
+        return (values * mask).sum() / mask.sum()
+
+
+def masked_var(values: mx.array, mask: mx.array, unbiased: bool = True) -> mx.array:
+    """Compute variance of tensor with masked values."""
+    mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+    if unbiased:
+        mask_sum = mask.sum()
+        if mask_sum == 0:
+            raise ValueError(
+                "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
+                "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
+            )
+        # note that if mask_sum == 1, then there is a division by zero issue
+        # to avoid it you just need to use a larger minibatch_size
+        bessel_correction = mask_sum / (mask_sum - 1)
+        variance = variance * bessel_correction
+    return variance
+
+
+def masked_whiten(values: mx.array, mask: mx.array, shift_mean: bool = True) -> mx.array:
+    """Whiten values with masked values."""
+    mean, var = masked_mean(values, mask), masked_var(values, mask)
+    whitened = (values - mean) * mx.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
+def clip_by_value(x: mx.array, tensor_min: float, tensor_max: float) -> mx.array:
+    """
+    Tensor extension to torch.clamp
+    https://github.com/pytorch/pytorch/issues/2793#issuecomment-428784713
+    """
+    clipped = mx.max(mx.min(x, tensor_max), tensor_min)
+    return clipped
+
+
+def entropy_from_logits(logits: mx.array) -> mx.array:
+    """Calculate entropy from logits."""
+    pd = mx.softmax(logits, axis=-1)
+    entropy = mx.logsumexp(logits, axis=-1) - mx.sum(pd * logits, axis=-1)
+    return entropy
+
+
+def stats_to_np(stats_dict: Dict) -> Dict:
+    """Cast all mx.arrays in dict to numpy arrays."""
+    new_dict = dict()
+    for k, v in stats_dict.items():
+        if isinstance(v, mx.array):
+            new_dict[k] = v
+            if new_dict[k].dtype == mx.bfloat16:
+                new_dict[k] = new_dict[k].astype(mx.float32)
+            new_dict[k] = np.array(new_dict[k])
+        else:
+            new_dict[k] = v
+        if np.isscalar(new_dict[k]):
+            new_dict[k] = float(new_dict[k])
+    return new_dict
+
+
+def flatten_dict(nested: Dict, sep: str = "/") -> Dict:
+    """Flatten dictionary and concatenate nested keys with separator."""
+
+    def recurse(nest: Dict, prefix: str, into: Dict) -> None:
+        for k, v in nest.items():
+            if sep in k:
+                raise ValueError(f"separator '{sep}' not allowed to be in key '{k}'")
+            if isinstance(v, Mapping):
+                recurse(v, prefix + k + sep, into)
+            else:
+                into[prefix + k] = v
+
+    flat = {}
+    recurse(nested, "", flat)
+    return flat
+
+
+def stack_dicts(stats_dicts: List[Dict]) -> Dict:
+    """Stack the values of a dict."""
+    results = dict()
+    for k in stats_dicts[0]:
+        stats_list = [mx.flatten(d[k]) for d in stats_dicts]
+        max_len = max([len(x) for x in stats_list])
+        padded = [mx.pad(a=x, pad_width=max_len, constant_value=-1) for x in stats_list]
+        results[k] = padded
+    return results
+
+
+def convert_to_scalar(stats: Dict) -> Dict:
+    """
+    Converts the stats from a flattened dict to single scalar dicts
+    """
+    tensorboard_stats = {}
+    for k, v in stats.items():
+        # for tensorboard compatibility - arrays and tensors are ignored with tensorboard
+        # therefore we convert single element tensors to scalars
+        if (isinstance(v, mx.array) or isinstance(v, np.ndarray)) and (
+            len(v.shape) == 0 or (len(v.shape) == 1 and v.shape[0] == 1)
+        ):
+            v = v.item()
+        tensorboard_stats[k] = v
+    return tensorboard_stats
 
 
 def pad_to_length(tensor: mx.array, length: int, pad_value, dim: int = -1) -> mx.array:
