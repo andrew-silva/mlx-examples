@@ -127,14 +127,13 @@ def pad_to_size(tensor: mx.array, size: int, dim: int = 1, padding: int = 50256)
 
 def logprobs_from_logits(logits: mx.array, labels: mx.array, gather: bool = True) -> mx.array:
     """
-    See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
+    Turn raw logit values into log probs with softmax + log -- make sure axis is correct
     """
     logp = mx.log(mx.softmax(logits, axis=2))
 
     if not gather:
         return logp
-    # TODO This is broken.
-    logpy = logp[mx.arange(logp.shape[0]), mx.arange(logp.shape[1]), labels[:, :, None]]
+    logpy = logp[mx.arange(logp.shape[0]), mx.arange(logp.shape[1]), labels[:, :]]
     return logpy
 
 
@@ -183,12 +182,21 @@ def masked_whiten(values: mx.array, mask: mx.array, shift_mean: bool = True) -> 
     return whitened
 
 
-def clip_by_value(x: mx.array, tensor_min: float, tensor_max: float) -> mx.array:
+def clip_by_value(x: mx.array, tensor_min, tensor_max) -> mx.array:
     """
     Tensor extension to torch.clamp
     https://github.com/pytorch/pytorch/issues/2793#issuecomment-428784713
     """
-    clipped = mx.max(mx.min(x, tensor_max), tensor_min)
+    max_tens = mx.concatenate([x, tensor_max], axis=0)
+    mins = mx.min(max_tens, axis=0)[None]
+    min_tens = mx.concatenate([mins, tensor_min], axis=0)
+    clipped = mx.max(min_tens, axis=0)[None]
+    # clipped = mx.max(
+    #     mx.stack(
+    #         (mx.min(
+    #             mx.stack((x, tensor_max), axis=0),
+    #             tensor_min)), axis=0)
+    # )
     return clipped
 
 
@@ -232,14 +240,53 @@ def flatten_dict(nested: Dict, sep: str = "/") -> Dict:
     return flat
 
 
+def extract_grads(d_in):
+    """
+    Recursively extract all arrays from a nested dictionary.
+
+    Parameters:
+        d_in: Input dictionary
+
+    Returns:
+        arrays: List of all arrays found
+    """
+    arrays = []
+    for k, v in d_in.items():
+        if isinstance(v, dict):
+            arrays.extend(extract_grads(v))
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    arrays.extend(extract_grads(item))
+        elif isinstance(v, mx.array):
+            arrays.append(v)
+    return arrays
+
+
+def replace_nans_get_means(logs):
+    for k, v in logs.items():
+        try:
+            v = v.tolist()
+            v = np.nan_to_num(v, nan=-100).mean().tolist()
+            logs[k] = v
+        except AttributeError:
+            logs[k] = v
+    return logs
+
+
 def stack_dicts(stats_dicts: List[Dict]) -> Dict:
     """Stack the values of a dict."""
     results = dict()
     for k in stats_dicts[0]:
         stats_list = [mx.flatten(d[k]) for d in stats_dicts]
         max_len = max([len(x) for x in stats_list])
-        padded = [mx.pad(a=x, pad_width=max_len, constant_value=-1) for x in stats_list]
-        results[k] = padded
+        padded = []
+        for x in stats_list:
+            if len(x) < max_len:
+                buffer = mx.ones(max_len-len(x)).astype(x.dtype)
+                x = mx.concatenate((x, buffer))
+            padded.append(x)
+        results[k] = mx.array(padded)
     return results
 
 
@@ -440,7 +487,7 @@ def load(path_or_hf_repo: str):
     return model, tokenizer, config
 
 
-def generate(
+def _generate_token(
     prompt: mx.array, model: nn.Module, temp: float = 0.0
 ) -> Generator[mx.array, None, None]:
     """
@@ -463,9 +510,60 @@ def generate(
         )
 
     y = prompt
+
     cache = None
     while True:
-        logits, cache = model(y[None], cache=cache)
+        if len(y.shape) < 2:
+            y = y[None]
+        logits, cache, _ = model(y, cache=cache)
+        if logits.shape[1] < 1:
+            logits = logits[:, None, :]
         logits = logits[:, -1, :]
+        if len(logits.shape) > 2:
+            print(logits.shape)
+            # logits = logits.squeeze()
+            # print(logits.shape)
         y = sample(logits)
         yield y
+
+
+def generate(model, prompt, tokenizer, args):
+    print(prompt, end="", flush=True)
+
+    prompt = mx.array(tokenizer.encode(prompt))
+
+    tokens = []
+    skip = 0
+    for token, n in zip(
+        _generate_token(prompt, model, args.temp),
+        range(args.max_tokens),
+    ):
+        if token == tokenizer.eos_token_id:
+            break
+
+        tokens.append(token.item())
+        s = tokenizer.decode(tokens)
+        if len(s) - skip > 1:
+            print(s[skip:-1], end="", flush=True)
+            skip = len(s) - 1
+    print(tokenizer.decode(tokens)[skip:], flush=True)
+    print("=" * 10)
+    if len(tokens) == 0:
+        print("No tokens generated for this prompt")
+        return
+
+
+def generate_ids(model, input_ids, eos_token_id=100_000, temperature=0.0, max_tokens=128):
+
+    prompt = mx.array(input_ids)
+    tokens = []
+    for token, n in zip(
+        _generate_token(prompt, model, temperature),
+        range(max_tokens),
+    ):
+        if token == eos_token_id:
+            break
+        if len(token.shape) < 2:
+            token = token[None]
+        tokens.append(token)
+    return mx.concatenate(tokens, axis=1)

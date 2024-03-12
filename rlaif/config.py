@@ -62,17 +62,17 @@ class PPOConfig:
     """The reward model to use - used only for tracking purposes"""
     remove_unused_columns: bool = True
     """Remove unused columns from the dataset if `datasets.Dataset` is used"""
-    tracker_project_name: str = "mlx_rl"
+    tracker_project_name: str = "mlx_rlaif"
     """Name of project to use for tracking"""
 
     # hyperparameters
     steps: int = 20000
     """Number of training steps"""
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-5
     """Adam learning rate"""
     adap_kl_ctrl: bool = True
     """Use adaptive KL control, otherwise linear"""
-    init_kl_coef: Optional[float] = 0.2
+    init_kl_coef: Optional[float] = 0.0  # 0.2
     """Initial KL penalty coefficient (used for adaptive and linear control)"""
     kl_penalty: Literal["kl", "abs", "mse", "full"] = "kl"
     """kl penalty options: 'kl': model_logp - ref_logp,  'abs': abs(kl),  'mse': mean squared error mse(kl) and 'full': the actual kl for all tokens in the distribution"""
@@ -88,9 +88,11 @@ class PPOConfig:
     """Range for clipping in PPO policy gradient loss"""
     cliprange_value: float = 0.2
     """Range for clipping values in loss calculation"""
+    clip_value_loss: bool = True
+    """Clip the value prediction loss, otherwise full value loss"""
     vf_coef: float = 0.1
     """Scaling factor for value loss"""
-    batch_size: int = 256
+    batch_size: int = 1
     """Number of samples per optimisation step"""
     mini_batch_size: int = 1
     """Number of samples optimized in each mini batch"""

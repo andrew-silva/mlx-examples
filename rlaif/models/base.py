@@ -24,8 +24,8 @@ class BaseModelArgs:
 
 
 def create_reference_model(
-    model: PreTrainedModelWrapper, num_shared_layers: int = None, pattern: str = None
-) -> PreTrainedModelWrapper:
+    model, num_shared_layers: int = None, pattern: str = None
+):
     """
     Creates a static reference copy of a model. Note that model will be in `.eval()` mode.
 

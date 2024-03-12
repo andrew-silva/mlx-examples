@@ -248,6 +248,7 @@ class Model(nn.Module):
         super().__init__()
         self.model = MixtralModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.v_head = nn.Linear(args.hidden_size, 1, bias=False)
 
     def __call__(
         self,
@@ -257,4 +258,4 @@ class Model(nn.Module):
         cache=None,
     ):
         out, cache = self.model(inputs, input_embeds, mask, cache)
-        return self.lm_head(out), cache
+        return self.lm_head(out), cache, self.v_head(out)

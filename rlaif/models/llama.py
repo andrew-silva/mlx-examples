@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
+import math
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -170,7 +171,7 @@ class LlamaModel(nn.Module):
         self,
         inputs: mx.array,
         input_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None,
         cache=None,
     ):
         if input_embeds is None:
@@ -178,16 +179,20 @@ class LlamaModel(nn.Module):
         else:
             h = input_embeds
 
-        mask = None
-        if h.shape[1] > 1 and mask is None:
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
-            mask = mask.astype(h.dtype)
+        if attention_mask is not None:
+            attention_mask = 1 - attention_mask
+            attention_mask *= -1e9
+            attention_mask = attention_mask.astype(h.dtype)
+
+        if h.shape[1] > 1 and attention_mask is None:
+            attention_mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
+            attention_mask = attention_mask.astype(h.dtype)
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         for e, layer in enumerate(self.layers):
-            h, cache[e] = layer(h, mask, cache[e])
+            h, cache[e] = layer(h, attention_mask, cache[e])
 
         return self.norm(h), cache
 
@@ -197,13 +202,14 @@ class Model(nn.Module):
         super().__init__()
         self.model = LlamaModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.v_head = nn.Linear(args.hidden_size, 1, bias=False)
 
     def __call__(
         self,
-        inputs: mx.array,
+        input_ids: mx.array,
         input_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None,
         cache=None,
     ):
-        out, cache = self.model(inputs, input_embeds, mask, cache)
-        return self.lm_head(out), cache
+        out, cache = self.model(input_ids, input_embeds, attention_mask, cache)
+        return self.lm_head(out), cache, self.v_head(out)

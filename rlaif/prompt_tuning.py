@@ -72,7 +72,7 @@ def build_parser():
         help="Number of validation batches, -1 uses the entire validation set.",
     )
     parser.add_argument(
-        "--learning-rate", type=float, default=1e-5, help="Adam learning rate."
+        "--learning-rate", type=float, default=1e-6, help="Adam learning rate."
     )
     parser.add_argument(
         "--steps-per-report",
@@ -159,7 +159,7 @@ def load(args):
 
 def loss(model, inputs, targets, lengths):
     # Run model on inputs
-    logits, _ = model(inputs)
+    logits, _, _ = model(inputs)
     logits = logits.astype(mx.float32)
 
     # Mask padding tokens
@@ -236,8 +236,11 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
         # Model update
+        print(grad)
+        # grad['model']['model']['embed_tokens']['weight'] = mx.zeros_like(grad['model']['model']['embed_tokens']['weight'])
         optimizer.update(model, grad)
         mx.eval(model.parameters(), optimizer.state, lvalue)
+        print(model.parameters())
 
         # Record loss
         losses.append(lvalue.item())
@@ -281,32 +284,6 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
     plt.savefig('train_losses.png')
     plt.plot(val_losses)
     plt.savefig('val_losses.png')
-
-
-def generate(model, prompt, tokenizer, args):
-    print(prompt, end="", flush=True)
-
-    prompt = mx.array(tokenizer.encode(prompt))
-
-    tokens = []
-    skip = 0
-    for token, n in zip(
-        prompt_utils.generate(prompt, model, args.temp),
-        range(args.max_tokens),
-    ):
-        if token == tokenizer.eos_token_id:
-            break
-
-        tokens.append(token.item())
-        s = tokenizer.decode(tokens)
-        if len(s) - skip > 1:
-            print(s[skip:-1], end="", flush=True)
-            skip = len(s) - 1
-    print(tokenizer.decode(tokens)[skip:], flush=True)
-    print("=" * 10)
-    if len(tokens) == 0:
-        print("No tokens generated for this prompt")
-        return
 
 
 if __name__ == "__main__":
@@ -370,4 +347,4 @@ if __name__ == "__main__":
 
     if args.prompt is not None:
         print("Generating")
-        generate(prompt_model, args.prompt, tokenizer, args)
+        prompt_utils.generate(prompt_model, args.prompt, tokenizer, args)

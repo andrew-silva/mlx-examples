@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import math
 import time
 import typing
 import warnings
 from contextlib import nullcontext
 from typing import Callable, List, Optional, Union
+import wandb
 
 import mlx.core
 import numpy as np
@@ -33,9 +35,9 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from utils import RunningMoments, stats_to_np, set_seed, \
-    masked_whiten, masked_mean, masked_var, clip_by_value, \
-    entropy_from_logits, logprobs_from_logits, flatten_dict, \
+from utils import RunningMoments, stats_to_np, set_seed, generate_ids, \
+    masked_whiten, masked_mean, masked_var, clip_by_value, replace_nans_get_means, \
+    entropy_from_logits, logprobs_from_logits, flatten_dict, extract_grads, \
     convert_to_scalar, stack_dicts, AdaptiveKLController, FixedKLController
 from config import PPOConfig
 
@@ -182,6 +184,12 @@ class PPOTrainer:
             self.current_device = mlx.core.Device
 
         self.running = RunningMoments()
+        self.logger = wandb.init(
+            project='RLAIF',
+            config=config,
+            save_code=True
+        )
+        self.loss_value_and_grad = nn.value_and_grad(self.model, self.loss_fn)
 
     def generate(
             self,
@@ -243,17 +251,25 @@ class PPOTrainer:
 
             if length_sampler is not None:
                 generation_kwargs["max_new_tokens"] = length_sampler()
-            response = self.model.generate(
-                input_ids=query_tensor[None, :], **generation_kwargs
-            )
+            response = generate_ids(model=self.model,
+                                    input_ids=query_tensor[None, :],
+                                    eos_token_id=self.tokenizer.eos_token_id,
+                                    temperature=0.0,
+                                    max_tokens=generation_kwargs['max_new_tokens'])
             if generate_ref_response:
                 with self.optional_peft_ctx():
-                    ref_response = ref_model.generate(input_ids=query_tensor[None, :], **generation_kwargs)
+                    ref_response = generate_ids(
+                        model=ref_model,
+                        input_ids=query_tensor[None, :],
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        temperature=0.0,
+                        max_tokens=generation_kwargs['max_new_tokens']
+                    )
 
-            if not return_prompt and not self.is_encoder_decoder:
-                response = response[:, query_tensor.shape[0]:]
-                if generate_ref_response:
-                    ref_response = ref_response[:, query_tensor.shape[0]:]
+            # if not return_prompt and not self.is_encoder_decoder:
+            #     response = response[:, query_tensor.shape[0]:]
+            #     if generate_ref_response:
+            #         ref_response = ref_response[:, query_tensor.shape[0]:]
 
         if generate_ref_response:
             return response, ref_response
@@ -280,9 +296,6 @@ class PPOTrainer:
         batch_size = min(len(query_tensors), batch_size)
 
         for i in range(0, len(query_tensors), batch_size):
-            if length_sampler is not None:
-                generation_kwargs["max_new_tokens"] = length_sampler()
-
             # prevent overflow if query tensors are not even multiple of bs
             end_index = min(len(query_tensors), i + batch_size)
 
@@ -294,8 +307,7 @@ class PPOTrainer:
                 inputs,
                 padding=True,
                 max_length=None,
-                pad_to_multiple_of=pad_to_multiple_of,
-                return_tensors="pt",
+                pad_to_multiple_of=pad_to_multiple_of
             )
 
             generations = model.generate(**padded_inputs, **generation_kwargs)
@@ -354,17 +366,11 @@ class PPOTrainer:
                     f"Batch size ({batch_size}) does not match number of examples - but got {len(tensor_list)} for: {name}"
                 )
 
-        # add queries, scores and responses on the correct device
-        queries = [tensor.to(self.current_device) for tensor in queries]
-        responses = [tensor.to(self.current_device) for tensor in responses]
-        scores = [tensor.to(self.current_device) for tensor in scores]
-        masks = [tensor.to(self.current_device) for tensor in masks] if masks is not None else None
-
         # squeeze scores if needed
         for i, score in enumerate(scores):
-            if score.dim() > 1:
-                raise ValueError(f"Scores must be 1-dimensional - got {score.dim()} for {score}")
-            elif score.dim() == 1:
+            if len(score.shape) > 1:
+                raise ValueError(f"Scores must be 1-dimensional - got {len(score.shape)} for {score}")
+            elif len(score.shape) == 1:
                 scores[i] = score.squeeze()
 
         return queries, responses, scores, masks
@@ -420,7 +426,7 @@ class PPOTrainer:
                 if curr_mean_reward > self.highest_reward:
                     self.highest_reward = curr_mean_reward
                     # push model to hub
-                    self.push_to_hub(**self.push_to_hub_kwargs)
+                    self.model.save_pretrained('best_reward.npz')
             self.compare_step += 1
 
         timing = dict()
@@ -429,32 +435,6 @@ class PPOTrainer:
         t = time.time()
 
         model_inputs = self.prepare_model_inputs(queries, responses)
-
-        if self.is_distributed:
-            pad_first = self.tokenizer.padding_side == "left"
-
-            model_inputs["input_ids"] = self.accelerator.pad_across_processes(
-                model_inputs["input_ids"],
-                dim=1,
-                pad_index=self.tokenizer.pad_token_id,
-                pad_first=pad_first,
-            )
-            model_inputs["attention_mask"] = self.accelerator.pad_across_processes(
-                model_inputs["attention_mask"], dim=1, pad_index=0, pad_first=pad_first
-            )
-            if self.is_encoder_decoder:
-                model_inputs["decoder_input_ids"] = self.accelerator.pad_across_processes(
-                    model_inputs["decoder_input_ids"],
-                    dim=1,
-                    pad_index=self.tokenizer.pad_token_id,
-                    pad_first=pad_first,
-                )
-                model_inputs["decoder_attention_mask"] = self.accelerator.pad_across_processes(
-                    model_inputs["decoder_attention_mask"],
-                    dim=1,
-                    pad_index=0,
-                    pad_first=pad_first,
-                )
 
         model_inputs_names = list(model_inputs.keys())
 
@@ -522,40 +502,32 @@ class PPOTrainer:
 
                 for mini_batch_start in range(0, self.config.backward_batch_size, self.config.mini_batch_size):
                     mini_batch_end = mini_batch_start + self.config.mini_batch_size
-                    mini_batch_inds = backward_batch_inds[mini_batch_start:mini_batch_end]
+                    mini_batch_inds = mx.array(backward_batch_inds[mini_batch_start:mini_batch_end])
                     mini_batch_dict = {
                         "logprobs": batch_dict["logprobs"][mini_batch_inds],
                         "values": batch_dict["values"][mini_batch_inds],
                         "masks": batch_dict["masks"][mini_batch_inds],
                         # hacks: the queries and responses are ragged.
-                        "queries": [batch_dict["queries"][i] for i in mini_batch_inds],
-                        "responses": [batch_dict["responses"][i] for i in mini_batch_inds],
+                        "queries": [batch_dict["queries"][i] for i in mini_batch_inds.tolist()],
+                        "responses": [batch_dict["responses"][i] for i in mini_batch_inds.tolist()],
                         "advantages": batch_dict["advantages"][mini_batch_inds],
                         "returns": batch_dict["returns"][mini_batch_inds],
                     }
                     for k in model_inputs_names:
-                        mini_batch_dict[k] = batch_dict[k][mini_batch_inds]
-                    with self.accelerator.accumulate(self.model):
-                        model_inputs = {k: mini_batch_dict[k] for k in model_inputs_names}
+                        mini_batch_dict[k] = mx.array(batch_dict[k])[mini_batch_inds]
+                    model_inputs = {k: mini_batch_dict[k] for k in model_inputs_names}
 
-                        logprobs, logits, vpreds, _ = self.batched_forward_pass(
-                            self.model,
-                            mini_batch_dict["queries"],
-                            mini_batch_dict["responses"],
-                            model_inputs,
-                            return_logits=True,
-                        )
-                        train_stats = self.train_minibatch(
-                            mini_batch_dict["logprobs"],
-                            mini_batch_dict["values"],
-                            logprobs,
-                            logits,
-                            vpreds,
-                            mini_batch_dict["masks"],
-                            mini_batch_dict["advantages"],
-                            mini_batch_dict["returns"],
-                        )
-                        all_stats.append(train_stats)
+                    train_stats = self.train_minibatch(
+                        old_logprobs=mini_batch_dict["logprobs"],
+                        values=mini_batch_dict["values"],
+                        queries=mini_batch_dict["queries"],
+                        responses=mini_batch_dict["responses"],
+                        model_inputs=model_inputs,
+                        mask=mini_batch_dict["masks"],
+                        advantages=mini_batch_dict["advantages"],
+                        returns=mini_batch_dict["returns"],
+                    )
+                    all_stats.append(train_stats)
 
             # typically, early stopping is done at the epoch level
             if self.config.early_stopping:
@@ -570,7 +542,9 @@ class PPOTrainer:
         train_stats = stack_dicts(all_stats)
 
         # reshape advantages/ratios such that they are not averaged.
-        train_stats["policy/advantages"] = mx.flatten(train_stats["policy/advantages"])[None, :]
+        train_stats["policy/advantages"] = mx.flatten(train_stats["policy/advantages"])
+        train_stats["policy/advantages"] = mx.array(np.nan_to_num(train_stats['policy/advantages'], nan=-1))
+        train_stats['policy/advantages'] = train_stats['policy/advantages'][None, :]
         # train_stats["policy/advantages"] = torch.nan_to_num(train_stats["policy/advantages"], WANDB_PADDING)
         train_stats["policy/ratio"] = mx.flatten(train_stats["policy/ratio"])[None, :]
 
@@ -589,12 +563,12 @@ class PPOTrainer:
         # Gather/Reduce stats from all processes
         stats = stats_to_np(stats)
         timing["time/ppo/calc_stats"] = time.time() - t
-        stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        stats["ppo/learning_rate"] = self.optimizer.learning_rate
 
         # Update the KL control - multiply the batch_size by the number of processes
         self.kl_ctl.update(
             stats["objective/kl"],
-            self.config.batch_size * self.accelerator.num_processes,
+            self.config.batch_size,
         )
 
         # Log the total ppo time
@@ -605,8 +579,8 @@ class PPOTrainer:
         if self.config.log_with != "wandb":
             stats = convert_to_scalar(stats)
 
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+        # if self.lr_scheduler is not None:
+        #     self.lr_scheduler.step()
 
         return stats
 
@@ -617,7 +591,7 @@ class PPOTrainer:
         This also handles the multi-gpu case where the policy KL is averaged across all processes.
 
         Args:
-            policy_kl (mx.array):
+            policykl (mx.array):
                 the policy KL
 
         Returns:
@@ -645,7 +619,7 @@ class PPOTrainer:
             input_data["decoder_input_ids"] = decoder_inputs["input_ids"]
             input_data["decoder_attention_mask"] = decoder_inputs["attention_mask"]
         else:
-            input_ids = [mx.concatenate([q, r]) for q, r in zip(queries, responses)]
+            input_ids = [mx.concatenate([q, r]).astype(q.dtype) for q, r in zip(queries, responses)]
             input_data = self.data_collator(
                 [{"input_ids": ids, "attention_mask": mx.ones_like(ids)} for ids in input_ids]
             )
@@ -687,23 +661,15 @@ class PPOTrainer:
         all_masks = []
         all_values = []
 
-        model.eval()
-
         for i in range(math.ceil(bs / fbs)):
-            input_kwargs = {key: value[i * fbs: (i + 1) * fbs] for key, value in model_inputs.items()}
+            input_kwargs = {k: mx.array(v[i * fbs: (i + 1) * fbs]) for k, v in model_inputs.items()}
             query_batch = queries[i * fbs: (i + 1) * fbs]
             response_batch = responses[i * fbs: (i + 1) * fbs]
             if response_masks is not None:
                 response_masks_batch = response_masks[i * fbs: (i + 1) * fbs]
-            logits, _, values = model(**input_kwargs)
-
-            if self.is_encoder_decoder:
-                input_ids = input_kwargs["decoder_input_ids"]
-                attention_mask = input_kwargs["decoder_attention_mask"]
-            else:
-                input_ids = input_kwargs["input_ids"]
-                attention_mask = input_kwargs["attention_mask"]
-
+            logits, cache, values = model(**input_kwargs)
+            input_ids = mx.array(input_kwargs["input_ids"])
+            attention_mask = mx.array(input_kwargs["attention_mask"])
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
             masks = mx.zeros_like(attention_mask)
             masks[:, :-1] = attention_mask[:, 1:]
@@ -747,9 +713,9 @@ class PPOTrainer:
             self,
             old_logprobs: mx.array,
             values: mx.array,
-            logprobs: mx.array,
-            logits: mx.array,
-            vpreds: mx.array,
+            queries: mx.array,
+            responses: mx.array,
+            model_inputs,
             mask: mx.array,
             advantages: mx.array,
             returns: mx.array,
@@ -758,32 +724,47 @@ class PPOTrainer:
         Train one PPO minibatch
 
         Args:
-            logprobs (`mx.array`):
+            old_logprobs (`mx.array`):
                 Log probabilities of the model, shape [mini_batch_size, response_length]
             values (`mx.array`):
                 Values of the value head, shape [mini_batch_size, response_length]
-            query (`mx.array`):
+            queries (`mx.array`):
                 Encoded queries, shape [mini_batch_size, query_length]
-            response (`mx.array`):
+            responses (`mx.array`):
                 Encoded responses, shape [mini_batch_size, response_length]
-            model_input (`mx.array`):
+            model_inputs (`mx.array`):
                 Concatenated queries and responses, shape [mini_batch_size, query_length+response_length]
+            mask:
+                mask
+            advantages:
+                advantages
+            returns:
+                returns
 
         Returns:
             train_stats (dict[str, `mx.array`]):
                 Dictionary of training statistics
         """
-        self.model.train()
-        loss_p, loss_v, train_stats = self.loss(
-            old_logprobs, values, logits, vpreds, logprobs, mask, advantages, returns
+        (lvalue, stats), grad = self.loss_value_and_grad(
+            model=self.model,
+            queries=queries,
+            responses=responses,
+            model_inputs=model_inputs,
+            old_logprobs=old_logprobs,
+            old_values=values,
+            mask=mask,
+            advantages=advantages,
+            returns=returns,
         )
-        loss = loss_p + loss_v
-        loss.backwards()
-        if self.config.max_grad_norm is not None:
-            self.accelerator.clip_grad_norm_(self.model_params, self.config.max_grad_norm)
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        return train_stats
+        # TODO: Clip grad norm
+        #         if self.config.max_grad_norm is not None:
+        #             self.accelerator.clip_grad_norm_(self.model_params, self.config.max_grad_norm)
+        # test_g = extract_grads(grad)
+        # print(f'Grad sums: {[mx.sum(mx.abs(g)) for g in test_g]}')
+        # Model update
+        self.optimizer.update(self.model, grad)
+        mx.eval(self.model.parameters(), self.optimizer.state, lvalue)
+        return stats
 
     def compute_rewards(
             self,
@@ -811,16 +792,16 @@ class PPOTrainer:
         rewards, non_score_rewards, kls = [], [], []
         for score, logprob, ref_logprob, mask in zip(scores, logprobs, ref_logprobs, masks):
             # compute KL penalty (from difference in logprobs)
-            kl = self._kl_penalty(logprob, ref_logprob)
-            kls.append(kl)
-            non_score_reward = -self.kl_ctl.value * kl
-            non_score_rewards.append(non_score_reward)
-            reward = non_score_reward.clone()
-            last_non_masked_index = mask.nonzero()[-1]
-
+            kl_p = self._kl_penalty(logprob, ref_logprob)
+            kls.append(kl_p)
+            non_score_rew = -self.kl_ctl.value * kl_p
+            non_score_rewards.append(non_score_rew)
+            rew = non_score_rew
+            last_non_masked_index = mx.array(np.nonzero(mask)[0][-1])  # Or remove the [0]
             # reward is preference model score + KL penalty
-            reward[last_non_masked_index] += score
-            rewards.append(reward)
+            rew[last_non_masked_index] += score
+            rewards.append(rew)
+
         return mx.stack(rewards), mx.stack(non_score_rewards), mx.stack(kls)
 
     def _kl_penalty(self, logprob: mx.array, ref_logprob: mx.array) -> mx.array:
@@ -848,13 +829,11 @@ class PPOTrainer:
         lastgaelam = 0
         advantages_reversed = []
         gen_len = rewards.shape[-1]
-
+        values = mx.reshape(values, rewards.shape)
         values = values * mask
         rewards = rewards * mask
-
         if self.config.whiten_rewards:
             rewards = masked_whiten(rewards, mask, shift_mean=False)
-
         for t in reversed(range(gen_len)):
             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
             delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
@@ -864,16 +843,16 @@ class PPOTrainer:
 
         returns = advantages + values
         advantages = masked_whiten(advantages, mask)
-        advantages = advantages.detach()
         return values, advantages, returns
 
-    def loss(
+    def loss_fn(
             self,
+            model,
+            queries,
+            responses,
+            model_inputs,
             old_logprobs: mx.array,
-            values: mx.array,
-            logits: mx.array,
-            vpreds: mx.array,
-            logprobs: mx.array,
+            old_values: mx.array,
             mask: mx.array,
             advantages: mx.array,
             returns: mx.array,
@@ -882,79 +861,74 @@ class PPOTrainer:
         Calculate policy and value losses.
 
         Args:
+            model:
+                model to use for forward passes
+            queries:
+                observations/queries to pass to the model
+            responses:
+                actions/responses from the model
+            model_inputs:
+                other necessary model inputs
             old_logprobs (`mx.array`):
                 Log probabilities of the model, shape (`batch_size`, `response_length`)
-            values (`mx.array`):
+            old_values (`mx.array`):
                 Values of the value head, shape (`batch_size`, `response_length`)
-            rewards (`mx.array`):
-                Rewards from the reward model, shape (`batch_size`, `response_length`)
-            logits (`mx.array`):
-                Logits of the model, shape (`batch_size`, `response_length`, `vocab_size`)
-            v_pred (`mx.array`):
-                Values of the value head, shape (`batch_size`, `response_length`)
-            logprobs (`mx.array`):
-                Log probabilities of the model, shape (`batch_size`, `response_length`)
+            mask (`mx.array`):
+                mask of positions we care about
+            advantages:
+                advantage array
+            returns:
+                rewards/returns
         """
-
-        vpredclipped = clip_by_value(
-            vpreds,
-            values - self.config.cliprange_value,
-            values + self.config.cliprange_value,
+        newlogprob, logits, newvalue, _ = self.batched_forward_pass(
+            model,
+            queries,
+            responses,
+            model_inputs,
+            return_logits=True,
         )
+        logratio = newlogprob - old_logprobs
+        ratio = logratio.exp()
 
-        vf_losses1 = (vpreds - returns) ** 2
-        vf_losses2 = (vpredclipped - returns) ** 2
-        vf_loss = 0.5 * masked_mean(mx.max(vf_losses1, vf_losses2), mask)
-        vf_clipfrac = masked_mean(vf_losses2.__gt__(vf_losses1).astype(mx.float32), mask)
+        # Policy loss
+        pg_loss1 = -advantages * ratio
+        pg_loss2 = -advantages * mx.clip(ratio, 1 - self.config.cliprange, 1 + self.config.cliprange)
+        pg_loss = mx.max(mx.stack([pg_loss1, pg_loss2]), axis=0).mean()
 
-        ratio = mx.exp(logprobs - old_logprobs)
-
-        pg_losses = -advantages * ratio
-        pg_losses2 = -advantages * mx.clip(ratio, 1.0 - self.config.cliprange, 1.0 + self.config.cliprange)
-
-        pg_loss = masked_mean(mx.max(pg_losses, pg_losses2), mask)
-        pg_clipfrac = masked_mean(pg_losses2.__gt__(pg_losses).astype(mx.float32), mask)
-
-        loss = pg_loss + self.config.vf_coef * vf_loss
-
-        avg_ratio = masked_mean(ratio, mask).item()
-        if avg_ratio > self.config.ratio_threshold:
-            warnings.warn(
-                f"The average ratio of batch ({avg_ratio:.2f}) exceeds threshold {self.config.ratio_threshold:.2f}. Skipping batch."
+        # Value Loss
+        if self.config.clip_value_loss:
+            vf_loss_unclipped = (newvalue - returns) ** 2
+            vf_clipped = old_values + mx.clip(
+                newvalue - old_values,
+                -self.config.cliprange_value,
+                self.config.cliprange_value,
             )
-            pg_loss = pg_loss * 0.0
-            vf_loss = vf_loss * 0.0
-            loss = loss * 0.0
+            vf_loss_clipped = (vf_clipped - returns) ** 2
+            vf_loss_max = mx.max(mx.stack([vf_loss_unclipped, vf_loss_clipped]), axis=0)
+            vf_loss = 0.5 * vf_loss_max.mean()
+        else:
+            vf_loss = 0.5 * ((newvalue - returns) ** 2).mean()
 
-        entropy = masked_mean(entropy_from_logits(logits), mask)
+        loss_v = pg_loss + vf_loss * self.config.vf_coef
 
-        approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, mask)
-        policykl = masked_mean(old_logprobs - logprobs, mask)
-
-        return_mean, return_var = masked_mean(returns, mask), masked_var(returns, mask)
-        value_mean, value_var = masked_mean(values, mask), masked_var(values, mask)
-
-        stats = dict(
-            loss=dict(policy=pg_loss.detach(), value=vf_loss.detach(), total=loss.detach()),
+        return loss_v, flatten_dict(dict(
+            loss=dict(policy=pg_loss, value=vf_loss, total=loss_v),
             policy=dict(
-                entropy=entropy.detach(),
-                approxkl=approxkl.detach(),
-                policykl=policykl.detach(),
-                clipfrac=pg_clipfrac.detach(),
-                advantages=advantages.detach(),
-                advantages_mean=masked_mean(advantages, mask).detach(),
-                ratio=ratio.detach(),
+                entropy=mx.array([0]),
+                approxkl=mx.array([0]),
+                policykl=mx.array([0]),
+                advantages=advantages,
+                advantages_mean=masked_mean(advantages, mask),
+                ratio=ratio,
             ),
-            returns=dict(mean=return_mean.detach(), var=return_var.detach()),
+            returns=dict(mean=mx.array([0]), var=mx.array([0])),
             val=dict(
-                vpred=masked_mean(vpreds, mask).detach(),
-                error=masked_mean((vpreds - returns) ** 2, mask).detach(),
-                clipfrac=vf_clipfrac.detach(),
-                mean=value_mean.detach(),
-                var=value_var.detach(),
+                vpred=masked_mean(newvalue, mask),
+                error=masked_mean((newvalue - returns) ** 2, mask),
+                mean=mx.array([0]),
+                var=mx.array([0]),
             ),
-        )
-        return pg_loss, self.config.vf_coef * vf_loss, flatten_dict(stats)
+        ))
 
     def record_step_stats(self, kl_coef: float, **data):
         """
@@ -982,7 +956,7 @@ class PPOTrainer:
             data["non_score_reward"], mask
         )  # non_score_reward is size `batch_size`, `response_length`
         mean_scores = data["scores"].mean()  # scores is size `batch_size`
-        std_scores = data["scores"].std()
+        std_scores = data["scores"].var().sqrt()
 
         if mean_kl.item() < -1.0:
             # warn users
@@ -1042,15 +1016,12 @@ class PPOTrainer:
         # all gather stats
         if not isinstance(rewards, mx.array):
             rewards = mx.array(rewards)
-        rewards = self.accelerator.gather(rewards).flatten()
+        rewards = rewards.flatten()
 
-        if self.config.log_with == "wandb":
-            import wandb
+        if any([column_to_log not in batch.keys() for column_to_log in columns_to_log]):
+            raise ValueError(f"Columns to log {columns_to_log} are not present in the batch {batch.keys()}.")
 
-            if any([column_to_log not in batch.keys() for column_to_log in columns_to_log]):
-                raise ValueError(f"Columns to log {columns_to_log} are not present in the batch {batch.keys()}.")
-
-            batch_list = [batch[column_to_log] for column_to_log in columns_to_log]
+        batch_list = [batch[column_to_log] for column_to_log in columns_to_log]
         logs = {}
 
         # Log stats
@@ -1061,24 +1032,18 @@ class PPOTrainer:
                 "'response'. "
             )
         elif self.config.log_with == "wandb":
-            table_rows = [list(r) for r in zip(*batch_list, rewards.cpu().tolist())]
-            logs.update({"game_log": wandb.Table(columns=[*columns_to_log, "reward"], rows=table_rows)})
+            table_rows = [list(r) for r in zip(*batch_list, rewards.tolist())]
+            wandb.log({"game_log": wandb.Table(columns=[*columns_to_log, "reward"], rows=table_rows)})
 
         logs.update(stats)
 
         logs["env/reward_mean"] = mx.mean(rewards).item()
         logs["env/reward_std"] = mx.var(rewards).sqrt().item()
-        logs["env/reward_dist"] = rewards
-
-        if self.config.log_with == "tensorboard":
-            # update the current step
-            self.current_step += 1
-
-        # TODO: WANDB LOG HERE
-        self.accelerator.log(
-            logs,
-            step=self.current_step if self.config.log_with == "tensorboard" else None,
-        )
+        logs["env/reward_dist"] = np.array(rewards)
+        for k, v in logs.items():
+            logs[k] = np.mean(v).item()
+        # logs = replace_nans_get_means(logs)
+        self.logger.log(logs)
 
     def _save_pretrained(self, save_directory: str) -> None:
         self.model.save_pretrained(save_directory)
