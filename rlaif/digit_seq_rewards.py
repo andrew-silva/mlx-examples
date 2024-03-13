@@ -82,11 +82,11 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
 
         for _ in range(sequence_length):
             # Bias the generation towards high-reward samples
-            if random.random() < 0.8:
+            if random.random() < (1-percent_noise):
                 # Generate a digit that matches the pattern
                 if reward_function.is_increasing:
                     digit = random.randint(sequence[-1], sequence[-1] + 10)
-                    digit += digit % reward_function.multiple_of
+                    digit += (reward_function.multiple_of - digit % reward_function.multiple_of)
                 elif reward_function.is_decreasing:
                     digit = random.randint(sequence[-1] - 10, sequence[-1])
                     digit -= digit % reward_function.multiple_of
