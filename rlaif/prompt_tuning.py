@@ -236,12 +236,9 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
         # Model update
-        print(grad)
         # grad['model']['model']['embed_tokens']['weight'] = mx.zeros_like(grad['model']['model']['embed_tokens']['weight'])
         optimizer.update(model, grad)
         mx.eval(model.parameters(), optimizer.state, lvalue)
-        print(model.parameters())
-
         # Record loss
         losses.append(lvalue.item())
         n_tokens += toks.item()

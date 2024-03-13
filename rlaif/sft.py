@@ -252,6 +252,7 @@ def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
         # Model update
         optimizer.update(mdl, grad)
         mx.eval(mdl.parameters(), optimizer.state, lvalue)
+        print(lvalue.item())
 
         # Record loss
         losses.append(lvalue.item())

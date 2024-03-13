@@ -85,8 +85,10 @@ if __name__ == "__main__":
         filename_prefix += 'decreasing_'
     filename_prefix += f'mult_{args.multiple_of}_'
     for ds, name in zip([train_data, val_data, test_data], ['train', 'valid', 'test']):
-        dict_ds = [{'text': x,
-                    'reward': reward_fn(x)} for x in ds]
+        dict_ds = [{"text": x,
+                    "reward": str(reward_fn(x)[0])} for x in ds]
 
         with open(f'./data/{filename_prefix}{name}.jsonl', 'w') as fp:
-            json.dump(dict_ds, fp)
+            for x in ds:
+                new_str = '{"text": "' + x + '", "reward": "' + str(reward_fn(x)[0]) + '"}\n'
+                fp.write(new_str)
