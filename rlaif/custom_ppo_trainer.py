@@ -398,6 +398,7 @@ class PPOTrainer:
         Returns:
             `dict[str, Any]`: A summary of the training statistics
         """
+        self.current_step += 1
         bs = self.config.batch_size
 
         queries, responses, scores, response_masks = self._step_safety_checker(
@@ -563,7 +564,7 @@ class PPOTrainer:
         # Gather/Reduce stats from all processes
         stats = stats_to_np(stats)
         timing["time/ppo/calc_stats"] = time.time() - t
-        stats["ppo/learning_rate"] = self.optimizer.learning_rate
+        stats["ppo/learning_rate"] = np.array(self.optimizer.learning_rate)
 
         # Update the KL control - multiply the batch_size by the number of processes
         self.kl_ctl.update(
@@ -958,7 +959,7 @@ class PPOTrainer:
         mean_scores = data["scores"].mean()  # scores is size `batch_size`
         std_scores = data["scores"].var().sqrt()
 
-        if mean_kl.item() < -1.0:
+        if mean_kl.item() < -1.0 and kl_coef > 0.0:
             # warn users
             warnings.warn(
                 f"KL divergence is starting to become negative: {mean_kl.item():.2f} - this might be a precursor for failed training."
@@ -1033,7 +1034,8 @@ class PPOTrainer:
             )
         elif self.config.log_with == "wandb":
             table_rows = [list(r) for r in zip(*batch_list, rewards.tolist())]
-            wandb.log({"game_log": wandb.Table(columns=[*columns_to_log, "reward"], rows=table_rows)})
+            wandb.log({f"game_log_{self.current_step % 25}": wandb.Table(columns=[*columns_to_log, "reward"],
+                                                                         rows=table_rows)})
 
         logs.update(stats)
 
@@ -1041,6 +1043,7 @@ class PPOTrainer:
         logs["env/reward_std"] = mx.var(rewards).sqrt().item()
         logs["env/reward_dist"] = np.array(rewards)
         for k, v in logs.items():
+            # print(f'{k}: {v}')
             logs[k] = np.mean(v).item()
         # logs = replace_nans_get_means(logs)
         self.logger.log(logs)

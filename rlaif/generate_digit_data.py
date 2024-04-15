@@ -3,7 +3,9 @@ import argparse
 import random
 import json
 
-
+"""
+python generate_digit_data.py --increasing --multiple-of 2 --num-samples 150
+"""
 def build_data_gen_parser():
     parser = argparse.ArgumentParser(description="Synthetic digit generation dataset generation.")
     # Generation args
@@ -70,13 +72,16 @@ if __name__ == "__main__":
     random.seed(args.seed)
     train_data = generate_synthetic_data(reward_function=reward_fn,
                                          num_samples=args.num_samples,
-                                         sequence_length_range=(args.min_length, args.max_length))
+                                         sequence_length_range=(args.min_length, args.max_length),
+                                         percent_noise=args.noise)
     val_data = generate_synthetic_data(reward_function=reward_fn,
                                        num_samples=args.num_samples,
-                                       sequence_length_range=(args.min_length, args.max_length))
+                                       sequence_length_range=(args.min_length, args.max_length),
+                                       percent_noise=args.noise)
     test_data = generate_synthetic_data(reward_function=reward_fn,
                                         num_samples=args.num_samples,
-                                        sequence_length_range=(args.min_length, args.max_length))
+                                        sequence_length_range=(args.min_length, args.max_length),
+                                        percent_noise=args.noise)
 
     filename_prefix = ''
     if args.increasing:

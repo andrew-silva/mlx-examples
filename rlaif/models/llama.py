@@ -203,6 +203,7 @@ class Model(nn.Module):
         self.model = LlamaModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.v_head = nn.Linear(args.hidden_size, 1, bias=False)
+        self.is_peft_model = False
 
     def __call__(
         self,

@@ -18,6 +18,11 @@ from models.prompt_tuning import PromptTuning
 from models.lora import LoRALinear
 
 
+"""
+python sft.py --prompt-tuning --save-file prompt_weights.npz --data-base increasing_mult_2_ --model /Users/andrewsilva/Desktop/research/code/tinkerings/mlx-examples/lora/tiny_llama --train
+python sft.py --save-file lora_weights.npz --data-base increasing_mult_2_ --model /Users/andrewsilva/Desktop/research/code/tinkerings/mlx-examples/lora/tiny_llama --train
+"""
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Soft Prompt finetuning.")
     parser.add_argument(
@@ -72,6 +77,12 @@ def build_parser():
         type=int,
         default=10,
         help="Number of prompt tokens to pre-pend",
+    )
+    parser.add_argument(
+        "--lora-layers",
+        type=int,
+        default=16,
+        help="Number of layers to fine-tune",
     )
     parser.add_argument("--batch-size", type=int, default=4, help="Minibatch size.")
     parser.add_argument(
@@ -154,7 +165,7 @@ class TuningDataset:
 def load(train_args):
     ds_base = train_args.data_base
     ds_names = (f"{ds_base}train", f"{ds_base}valid", f"{ds_base}test")
-
+    
     train_data, valid, test = (TuningDataset(Path(train_args.data) / f"{n}.jsonl") for n in ds_names)
     if train_args.train and len(train_data) == 0:
         raise ValueError(

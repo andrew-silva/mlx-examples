@@ -76,10 +76,13 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
         sequence_length = random.randint(*sequence_length_range)
         if reward_function.is_increasing:
             start_range = (0, 10)
+
         else:
             start_range = (100, 1000)
-        sequence = [random.randint(*start_range)]
 
+        first_digit = random.randint(*start_range)
+        first_digit += (reward_function.multiple_of - first_digit % reward_function.multiple_of)
+        sequence = [first_digit]
         for _ in range(sequence_length):
             # Bias the generation towards high-reward samples
             if random.random() < (1-percent_noise):
